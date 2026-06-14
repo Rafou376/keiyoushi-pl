@@ -10,7 +10,9 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.parseAs
+import okhttp3.Cookie
 import okhttp3.FormBody
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -19,6 +21,8 @@ import org.jsoup.nodes.Element
 import rx.Observable
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.time.Duration.Companion.seconds
 
 class LittleTyrant :
@@ -29,7 +33,11 @@ class LittleTyrant :
         dateFormat = SimpleDateFormat("MMM dd, yyyy", Locale("pt", "BR")),
     ) {
 
+    override fun headersBuilder() = super.headersBuilder()
+        .add("X-Reader-Sec", "tiraninha-web")
+
     override val client: OkHttpClient = network.client.newBuilder()
+        .addInterceptor { chain -> imageIntercept(chain) }
         .rateLimit(3, 1.seconds)
         .build()
 
@@ -87,7 +95,6 @@ class LittleTyrant :
     override fun chapterFromElement(element: Element) = SChapter.create().apply {
         name = element.selectFirst("span.mc-chapter-title")!!.text()
         date_upload = parseChapterDate(element.selectFirst(".mc-chapter-date")?.text())
-        // The source chapter list is out of order, so extract the number here for later sorting
         CHAPTER_NUMBER_REGEX.find(name)?.groupValues?.last()?.toFloatOrNull()?.let {
             chapter_number = it
         }
@@ -102,8 +109,11 @@ class LittleTyrant :
             val doc = response.asJsoup()
             launchIO { countViews(doc) }
 
-            decoder.extractPaths(doc).mapIndexed { idx, url ->
-                Page(idx, imageUrl = url)
+            val referer = response.request.url.toString()
+            ensureValidToken(referer)
+
+            decoder.extractPaths(doc, baseUrl).mapIndexed { idx, url ->
+                Page(idx, url = referer, imageUrl = url)
             }
         }
 
@@ -111,13 +121,116 @@ class LittleTyrant :
 
     // =============================== Images =================================
 
-    override fun imageRequest(page: Page): Request {
-        val imageHeaders = headers.newBuilder()
-            .set("Accept", "image/webp,image/*,*/*")
-            .set("Referer", "$baseUrl/")
-            .build()
-        return GET(page.imageUrl!!, imageHeaders)
+    @Volatile private var imageSecToken = ""
+    private val tokenLock = ReentrantLock()
+
+    private fun fetchGatekeeperToken(referer: String): String? {
+        val gatekeeperUrl = "$baseUrl/wp-content/themes/madara2/gatekeeper.php?t=${System.currentTimeMillis()}"
+        val gatekeeperReq = GET(
+            gatekeeperUrl,
+            headers.newBuilder()
+                .set("Accept", "*/*")
+                .set("Accept-Language", "pt-BR,pt;q=0.9")
+                .set("Sec-Fetch-Dest", "empty")
+                .set("Sec-Fetch-Mode", "cors")
+                .set("Sec-Fetch-Site", "same-origin")
+                .set("Referer", referer)
+                .build(),
+        )
+
+        return try {
+            network.client.newCall(gatekeeperReq).execute().use { res ->
+                if (res.isSuccessful) {
+                    res.parseAs<TokenDto>().token
+                } else {
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            null
+        }
     }
+
+    private fun ensureValidToken(referer: String, force: Boolean = false): Boolean {
+        if (!force && imageSecToken.isNotEmpty()) return true
+
+        return tokenLock.withLock {
+            if (!force && imageSecToken.isNotEmpty()) return true
+            val token = fetchGatekeeperToken(referer)
+            if (token != null) {
+                imageSecToken = token
+                android.util.Log.d("LittleTyrant", "Token Refreshed: $imageSecToken")
+                true
+            } else {
+                android.util.Log.e("LittleTyrant", "Failed to refresh token")
+                false
+            }
+        }
+    }
+
+    private fun imageIntercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+
+        if (!request.url.encodedPath.contains("image-loader.php")) {
+            return chain.proceed(request)
+        }
+
+        val referer = request.header("Referer") ?: "$baseUrl/"
+        ensureValidToken(referer)
+
+        fun updateCookieJarWithToken() {
+            if (imageSecToken.isNotEmpty()) {
+                val cookie = Cookie.Builder()
+                    .domain(request.url.host)
+                    .path("/")
+                    .name("lt_sec_val")
+                    .value(imageSecToken)
+                    .build()
+
+                network.client.cookieJar.saveFromResponse(request.url, listOf(cookie))
+            }
+        }
+
+        fun proceedWithToken(): Response {
+            val requestBuilder = request.newBuilder()
+
+            if (imageSecToken.isNotEmpty()) {
+                requestBuilder.header("Cookie", "lt_sec_val=$imageSecToken")
+            }
+
+            return chain.proceed(requestBuilder.build())
+        }
+
+        var response = proceedWithToken()
+
+        if (response.code == 403) {
+            response.close()
+            android.util.Log.d("LittleTyrant", "Got 403, forcing token refresh...")
+            ensureValidToken(referer, force = true)
+            response = proceedWithToken()
+        }
+
+        if (!response.isSuccessful) return response
+
+        if (response.header("Content-Type") == "application/octet-stream") {
+            return response.newBuilder()
+                .header("Content-Type", "image/jpeg")
+                .build()
+        }
+
+        return response
+    }
+
+    override fun imageRequest(page: Page): Request = GET(
+        page.imageUrl!!,
+        headers.newBuilder()
+            .set("Referer", page.url)
+            .set("Accept", "image/avif,image/webp,image/apng,image/jpeg,image/png,*/*;q=0.8")
+            .set("Sec-Fetch-Dest", "image")
+            .set("Sec-Fetch-Mode", "no-cors")
+            .set("Sec-Fetch-Site", "same-origin")
+            .build(),
+    )
 
     companion object {
         private val CHAPTER_NUMBER_REGEX = """\d+(?:\.\d+)?""".toRegex()

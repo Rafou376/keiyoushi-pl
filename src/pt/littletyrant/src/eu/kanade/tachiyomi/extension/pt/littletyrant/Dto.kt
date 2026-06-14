@@ -18,4 +18,6 @@ class HtmlDto(
 )
 
 @Serializable
-class TokenDto(val token: String)
+class TokenDto(
+    val token: String,
+)

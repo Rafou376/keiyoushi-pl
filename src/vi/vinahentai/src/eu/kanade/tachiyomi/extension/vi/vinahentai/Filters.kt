@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.extension.vi.vinahentai
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.util.asJsoup
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Response
 
 fun getFilters(genres: List<Pair<String, String>>): FilterList = FilterList(
@@ -22,11 +23,17 @@ fun parseGenresFromHtml(response: Response): List<Pair<String, String>> {
 
     return document.select("a[href*=/genres/]")
         .mapNotNull { element ->
-            val slug = element.attr("href")
-                .substringAfter("/genres/")
-                .substringBefore("?")
-                .substringBefore("/")
-            val name = element.text().trim()
+            val url = element.absUrl("href").toHttpUrlOrNull() ?: return@mapNotNull null
+            val segments = url.pathSegments
+            val genreIndex = segments.indexOf("genres")
+
+            val slug = if (genreIndex != -1 && genreIndex + 1 < segments.size) {
+                segments[genreIndex + 1]
+            } else {
+                return@mapNotNull null
+            }
+
+            val name = element.text()
             if (slug.isNotEmpty() && name.isNotEmpty() && seenSlugs.add(slug)) {
                 Pair(name, slug)
             } else {
